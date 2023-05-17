@@ -28,17 +28,8 @@ struct Image_struct {
 #include <iostream>
 #include <iomanip>
 
-void blur(Filter filter, Image_struct input_img, Image_struct* output_img, int offset_rows);
+void blur(Filter filter, Image_struct input_img, Image_struct* output_img);
 Image_struct add_zero_padding(Image_struct input_img, int filter_size);
-void printMatrix(const int* matrix, int m, int n)
-{
-	for (int i = 0; i < m; i++) {
-		for (int j = 0; j < n; j++) {
-			std::cout << std::setw(5) << matrix[i * n + j] << " ";
-		}
-		std::cout << std::endl;
-	}
-}
 
 int* inputImage(int* w, int* h, System::String^ imagePath) //put the size of image in w & h
 {
@@ -107,7 +98,6 @@ void createImage(int* image, int width, int height, int index)
 
 int main()
 {
-	int* final_data{};
 
 	MPI_Init(NULL, NULL);
 	int world_size, world_rank;
@@ -122,12 +112,13 @@ int main()
 	img = "..//Data//Input//lena.png";
 
 	Filter filter;
-	Image_struct padded_img{};
-	Image_struct sub_img{};
-	Image_struct* final_output_img = new Image_struct();
-	int* start_displacement_arr = new int[world_size];
-	int* send_counts = new int[world_size];
-	int* gather_output_sizes = new int[world_size];
+	Image_struct padded_img{};	// will be scattered among processes
+	Image_struct sub_img{};		// will hold the scattered data
+	Image_struct* final_output_img = new Image_struct();	// will hold the gathered results from processes
+	int* start_displacement_arr{};							// Entry i specifies the displacement (relative to the send-buffer) from which to take the outgoing padded image data to process i
+	int* send_counts = new int[world_size];					// Entry i specifies the number of elements to send to each process from the send-buffer
+	int* gather_output_sizes{};								// Holds the output size of each process so that Gatherv can know how much to receive from each process
+	int* recieve_displs{};									// Entry i specifies the displacement relative to recvbuf at which to place the incoming data from process i into the final output image
 	if (world_rank == 0) {
 		//Filter intialization
 		cout << "Enter kernel size (must be an odd number)" << endl;
@@ -145,11 +136,15 @@ int main()
 		imagePath = marshal_as<System::String^>(img);
 		input_img.data = inputImage(&input_img.width, &input_img.height, imagePath);
 
-		cout << "input Image width = " << input_img.width << "\n" << "input Image height = " << input_img.height << endl;
-		
+		cout << "input Image dimensions = " << input_img.width << " x " << input_img.height << endl;
+
 		//add zero padding to input image
 		padded_img = add_zero_padding(input_img, filter.size);
+		cout << "padded Image dimensions = " << padded_img.width << " x " << padded_img.height << endl;
 
+		//the timer starts exactly before the code written for MPI runs
+		start_s = clock();
+		
 		// the image will be split at the rows with full width
 		sub_img.height = (padded_img.height / world_size);
 		sub_img.width = padded_img.width; 
@@ -162,24 +157,28 @@ int main()
 			send_counts[i] = base_send_count + (offset_rows * sub_img.width);
 		}
 		//calculate the start of every process in the padded image
-		int row_displacement = 0;
-		start_displacement_arr[0] = row_displacement;
+		start_displacement_arr = new int[world_size];
+		int displacement = 0;
+		start_displacement_arr[0] = displacement;
 		for (int i = 1; i < world_size; i++) {
-			row_displacement = (base_send_count * i) - (offset_rows * sub_img.width);
-			start_displacement_arr[i] = row_displacement;
+			displacement = (base_send_count * i) - (offset_rows * sub_img.width);
+			start_displacement_arr[i] = displacement;
 		}
-		final_data = new int[input_img.width * input_img.height];
+		//setup the final output image
 		final_output_img->data = new int[input_img.width * input_img.height];
 		final_output_img->width = input_img.width;
 		final_output_img->height = input_img.height;
-		//free the input image allocated memory
+
+		//We won't need the input image again in the code
 		delete input_img.data;
-		//start timer
-		start_s = clock();
+
+		// these are only needed by procees 0
+		gather_output_sizes = new int[world_size];
+		recieve_displs = new int[world_size];
+
 		//broadcast the filter
 		MPI_Bcast(&filter.size, 1, MPI_INT, 0, MPI_COMM_WORLD);
 		MPI_Bcast(filter.data, (filter.size * filter.size), MPI_INT, 0, MPI_COMM_WORLD);
-
 
 	}
 	else {
@@ -189,37 +188,32 @@ int main()
 		MPI_Bcast(filter.data, (filter.size * filter.size), MPI_INT, 0, MPI_COMM_WORLD);
 
 	}
-	//broadcast the sendcount array
+	// Each process uses the send_counts array to calculate the height of it's sub image
 	MPI_Bcast(send_counts, world_size, MPI_INT, 0, MPI_COMM_WORLD);
-	//broadcast the sub image dimensions
+	// All processes will have the same sub image width
 	MPI_Bcast(&sub_img.width, 1, MPI_INT, 0, MPI_COMM_WORLD);
 
-	//scatter the padded image
+	// calculate the height based on how much the process should receive
 	sub_img.height = send_counts[world_rank] / sub_img.width;
-	sub_img.data = new int[((sub_img.height + (filter.size - 1)) * sub_img.width)];//assum the largest size of data
-	cout << "Rank "<<world_rank<<" Sub image height = "<<sub_img.height << endl;
+	sub_img.data = new int[send_counts[world_rank]];
+	
+	//scatter the padded image
 	MPI_Scatterv(
 		padded_img.data, send_counts, start_displacement_arr, MPI_INT,
-		sub_img.data, ((sub_img.height + (filter.size - 1)) * sub_img.width), MPI_INT,
+		sub_img.data, (sub_img.height * sub_img.width), MPI_INT,
 		0, MPI_COMM_WORLD
-	);
-	//createImage(sub_img.data, sub_img.width, sub_img.height, world_rank);
-	
+	);	
 
 	Image_struct* local_output_img = new Image_struct();
 
-	cout << "Rank  " << world_rank << " sub_img dimensions = " <<sub_img.width<<" x "<<sub_img.height << ", send count = " <<send_counts[world_rank]<< endl;
-	blur(filter, sub_img, local_output_img, 0);
+	cout << "Rank " << world_rank << " sub image dimensions = " <<sub_img.width<<" x "<<sub_img.height << ", send count = " <<send_counts[world_rank]<< endl;
+	blur(filter, sub_img, local_output_img);
 
-	MPI_Barrier(MPI_COMM_WORLD);
-
-	//Gather the local_outputs into the final_output image
-	//gather the local_output sizes into gather_displs array
+	//Gathers all the local-output-images sizes so that they can be used to calculate the displacement of each local-output-image into the final image
 	int local_output_img_size = (local_output_img->width * local_output_img->height);
-	int* recieve_displs = new int[world_size];
 	MPI_Gather(&local_output_img_size, 1, MPI_INT, gather_output_sizes, 1, MPI_INT, 0, MPI_COMM_WORLD);
 	if (world_rank == 0) {
-		//calculate displacements
+		// each local-output-image is placed at a displacement that is equal to the sum of the sizes of the local-output-images before it
 		recieve_displs[0] = 0;
 		for (int i = 1; i < world_size; i++) {
 			recieve_displs[i] = 0;
@@ -230,46 +224,40 @@ int main()
 
 	}
 
-	MPI_Barrier(MPI_COMM_WORLD);
+	// Gather the final-output-image from all the local-output-images
 	MPI_Gatherv(
 		local_output_img->data, (local_output_img->height * local_output_img->width), MPI_INT,
 		final_output_img->data, send_counts, recieve_displs,MPI_INT, 0,MPI_COMM_WORLD
 		);
-		
+	// process 0 is responsible for creating the final image
 	if (world_rank == 0) {
-		createImage(final_output_img->data, final_output_img->width, final_output_img->height, world_rank + 5);
-	
+		// the timer stops right after the final output image is gathered from all the processes
+		stop_s = clock();
+		TotalTime += (stop_s - start_s) / double(CLOCKS_PER_SEC) * 1000;
+		cout << "time: " << TotalTime << endl;
+		
+		cout << "output Image dimensions = " << final_output_img->width << " x " << final_output_img->height << endl;
+		createImage(final_output_img->data, final_output_img->width, final_output_img->height, world_rank);
 	}
 	
-	//stop timer
-	//stop_s = clock();
-
-	//cout << "output Image width = " << output_img->width << "\n" << "output Image height = " << output_img->height << endl;
-
-	//TotalTime += (stop_s - start_s) / double(CLOCKS_PER_SEC) * 1000;
-
-	//create the image
-	//createImage(output_img->data, output_img->width, output_img->height, world_rank);
-	MPI_Barrier(MPI_COMM_WORLD);
-
-	//cout << "time: " << TotalTime << endl;
 	delete filter.data;
 	delete local_output_img->data;
 	delete sub_img.data;
+	delete send_counts;
 	if (world_rank == 0) {
 		delete padded_img.data;
 		delete final_output_img->data;
+		delete start_displacement_arr;
+		delete gather_output_sizes;
+		delete recieve_displs;
+
 	}
-	delete send_counts;
-	delete start_displacement_arr;
-	delete gather_output_sizes;
-	delete recieve_displs;
 	MPI_Finalize();
 
 }
 
-void blur(Filter filter, Image_struct input_img, Image_struct* output_img, int offset_rows) {
-	output_img->height = (input_img.height - filter.size + 1) - offset_rows;
+void blur(Filter filter, Image_struct input_img, Image_struct* output_img) {
+	output_img->height = (input_img.height - filter.size + 1);
 	output_img->width = input_img.width - filter.size + 1;
 
 	output_img->data = new int[output_img->height * output_img->width];
@@ -301,7 +289,5 @@ Image_struct add_zero_padding(Image_struct input_img, int filter_size) {
 				= input_img.data[i * input_img.width + j];
 		}
 	}
-	cout << "Padded image height and width = " << padded_img.height << endl;
-
 	return padded_img;
 }
